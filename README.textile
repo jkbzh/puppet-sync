@@ -49,7 +49,7 @@ Now you need to add the following to the Git hook file:
 
 <pre>
   #!/bin/sh
-  # File: /git/puppet.git/hooks/post-update
+  # File: /git/puppet.git/hooks/post-receive
 
   REPO="git@githost.cat.pdx.edu:puppet.git"
   DEPLOY="/etc/puppet/environments"
