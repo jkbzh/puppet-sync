@@ -1,6 +1,6 @@
 h1. Puppet Sync
 
-This project provides a script to synchronize you manifests from a GIT
+This project provides a script to synchronize your manifests from a GIT
 repository to your Puppet master.
 
 h2. Usage
