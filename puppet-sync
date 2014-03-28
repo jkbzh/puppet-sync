@@ -69,16 +69,20 @@ class PuppetSync
     @options.environment = @options.branch if @options.environment.nil?
 
     deploy = deploy_directory(@options.environment)
-    output "---------------------------------------------- PuppetSync ---", ".-"
-    output "Host        : #{Socket.gethostbyname(Socket.gethostname).first}"
-    output "Branch      : #{@options.branch}"
-    output "Deploy To   : #{deploy}" unless @options.delete
-    output "Delete From : #{deploy}" if @options.delete
-    output "Repository  : #{@options.repository}"
+    output "---------------------------------------------- PuppetSync ---", ".-" unless @options.quiet
+    output "Host        : #{Socket.gethostbyname(Socket.gethostname).first}" unless @options.quiet
+    output "Branch      : #{@options.branch}" unless @options.quiet
+    output "Deploy To   : #{deploy}" unless @options.quiet and (not @options.delete)
+    output "Delete From : #{deploy}" if @options.delete and (not @options.quiet)
+    output "Repository  : #{@options.repository}" unless @options.quiet
 
-    self.update(@options.branch, @options.environment, :delete => @options.delete)
+    exit_code = self.update(@options.branch, @options.environment, :delete => @options.delete)
 
-    output "-------------------------------------------------------------\n", "`-"
+
+    output "-------------------------------------------------------------\n", "`-" unless @options.quiet
+    if exit_code == 1
+      abort
+    end
   end
 
   def update(branch, environment, opts={})
@@ -127,8 +131,10 @@ class PuppetSync
       end
     end
   rescue => exception
-    output exception.message
+    output exception.message unless @options.quiet or @options.verbose
     output exception.backtrace if @options.verbose
+    return 1
+  return 0
   end
 
   def git(subcommand, *args)
@@ -193,6 +199,9 @@ class PuppetSync
       @options.submodules = paths.split(',').join(' ')
     end
 
+    opts.on('-q', '--quiet', 'Only print Errors') do
+      @options.quiet = true
+    end
     opts.separator "Common options:"
     opts.on('-V', '--version', 'Display the script version.') { output_version ; exit 0; }
     opts.on('-v', '--verbose', 'Be more verbose.') { @options.verbose = true }
