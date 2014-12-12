@@ -14,6 +14,7 @@ Usage: puppet-sync -b BRANCH [options]
     -r, --repository URL             Git url for the repository.
     -s SUBMODULES                    Comma-seperated list of submodule paths to enable.
         --submodules-enabled
+    -fs --full-sync                  Do a full sync: download missing environments and delete non-existing ones
 Common options:
     -V, --version                    Display the script version.
     -v, --verbose                    Be more verbose.
