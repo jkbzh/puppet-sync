@@ -1,5 +1,24 @@
 #!/usr/bin/env ruby
 #
+# W3C Version of Puppet Sync.
+#
+# Extensions:
+#
+# - System locks for avoiding race conditions
+# - Mapping of branches to local environments (overridding the
+#   CLI argument)
+# - full-sync CLI argument (-fs) to force a synchronize between
+#   the local environments and remote branches, including removal
+#   of non-existing ones
+# - forbid deleting of the local "production" branch.
+# - chmod of top-level directory when doing a git clone
+# - set up a default umask for files that are created outside of git 
+#   (e.g., locks)
+#
+# Extended by Brett Smith and Jose Kahan
+# 
+# Original copyright and info follows.
+#
 # Copyright 2011, Reid Vandewiele <marut@cat.pdx.edu>
 #
 # Credits:
@@ -39,11 +58,18 @@ require 'open3'
 require 'optparse'
 require 'ostruct'
 require 'socket'
+require 'set'
 
 class PuppetSync
 
-  VERSION = "1.2-pdxcat2"
+  VERSION = "1.2-pdxcat2+w3c1"
   STAMP   = ".puppet-sync-stamp"
+
+  # Mapping of branches to directories.  In many cases, the master branch is 
+  # checked out to the 'development' environment.
+  BRANCH_MAP = {
+    "master" => "production",
+  }
 
   def initialize(arguments)
     @arguments = arguments
@@ -52,6 +78,8 @@ class PuppetSync
 
     # Ensure nothing unexpected happens because of environment variables
     ENV.delete('GIT_DIR')
+    # Set the umaks to new files we create outside of git
+    File.umask('007'.to_i(8))
   end
 
   def output lines, prefix = '| '
@@ -66,23 +94,124 @@ class PuppetSync
     unless parsed_options? && arguments_valid?
       abort "ERROR: invalid arguments given."
     end
-    @options.environment = @options.branch if @options.environment.nil?
 
-    deploy = deploy_directory(@options.environment)
+    # setup a lock to avoid race conditions. 
+    # Lock will be removed automatically when script exits
+    File.open("/var/lock/puppet-sync/#{File.basename $0}.lock", File::RDWR|File::CREAT, 0664).flock(File::LOCK_EX)
+
+    if not @options.full_sync
+      if not valid_branchname(@options.branch)
+        abort %Q{Branch "#{@options.branch}" contains non-word characters, ignoring it.}
+      elsif @options.branch == "production"
+        abort %Q{ERROR: branch "production" is reserved. Use branch "master" instead.}
+      end
+    end
+
     output "---------------------------------------------- PuppetSync ---", ".-" unless @options.quiet
-    output "Host        : #{Socket.gethostbyname(Socket.gethostname).first}" unless @options.quiet
-    output "Branch      : #{@options.branch}" unless @options.quiet
-    output "Deploy To   : #{deploy}" unless @options.quiet and (not @options.delete)
-    output "Delete From : #{deploy}" if @options.delete and (not @options.quiet)
-    output "Repository  : #{@options.repository}" unless @options.quiet
+    if @options.full_sync 
+      output "Syncing local deploy directory with remote repository" unless @options.quiet
+      output "Host       : #{Socket.gethostbyname(Socket.gethostname).first}" unless @options.quiet
+      output "Repository : #{@options.repository}" unless @options.quiet
+      output "Deploy to  : #{@options.deploy}" unless @options.quiet
 
-    exit_code = self.update(@options.branch, @options.environment, :delete => @options.delete)
+      exit_code = self.full_sync()
+    else
+      # name of the deployment environment. Use the branch name by default
+      @options.environment = @options.branch if @options.environment.nil?
+      
+      deploy = deploy_directory(@options.environment)
 
-
+      output "Host        : #{Socket.gethostbyname(Socket.gethostname).first}" unless @options.quiet
+      output "Branch      : #{@options.branch}" unless @options.quiet
+      output "Deploy To   : #{deploy}" unless @options.delete or @options.quiet
+      output "Delete From : #{deploy}" if @options.delete and (not @options.quiet)
+      output "Repository  : #{@options.repository}" unless @options.quiet
+      
+      exit_code = self.update(@options.branch, @options.environment, :delete => @options.delete)
+    end
+    
     output "-------------------------------------------------------------\n", "`-" unless @options.quiet
     if exit_code == 1
       abort
     end
+  end
+
+  def full_sync()
+    # Attempts to synchronize the local environments with the remote
+    # repository.  We first delete the local branches that don't exist
+    # anymore in the remote repository and then do a local sync with
+    # those that exist in the remote, creating new ones as needed. We
+    # use the update() function in both cases.
+
+    deploy = @options.deploy
+    if not File.exists?(deploy) or not File.directory?(deploy)
+      raise "ERROR: #{deploy} is not an environment directory."
+    end
+    
+    # Create a set that includes the names of all local environments (directories)
+    environments = []
+    reverse_branch_map = BRANCH_MAP.invert
+    Dir.entries(deploy).select {|f| 
+      if File.directory? "#{deploy}/#{f}" and f[0] != '.'
+        if not File.exists?("#{deploy}/#{f}/#{STAMP}")
+          output "WARNING: #{f} environment is not managed by puppet-sync. Ignoring it." unless @options.quiet
+        else
+          # map the local branch aliases to the remote repository name
+          f = reverse_branch_map[f] if reverse_branch_map[f]
+
+          environments.push(f)
+        end
+      end
+    }
+
+    # Create a set that includes the names of all remote branches
+    ls_remote = git(:"ls-remote", "--heads", @options.repository)
+    if ls_remote.nil? 
+      raise "ERROR: No remote branches found at #{options.repository}"
+    end
+
+    # each entry is returned as
+    # bd691b836...19704        refs/heads/branch_name
+    # we remove everything except for the branch_name
+    rbranches = ls_remote.split("\n").map {|branch| branch.split('/',3)[2] }
+
+    exit_code = 0
+
+    # Delete the environments that do not exist upstream
+    unless environments.empty?
+      exist_only_locally = environments.to_set - rbranches.to_set
+      unless exist_only_locally.empty?
+        output "deleting old local branches" if @options.verbose
+        for branch in exist_only_locally 
+          # we assume branchname == environment
+          # Mapping into a diff. environment name is done in the update function
+          exit_code |= update(branch, branch, {:delete => 1})
+        end
+      end
+    end
+    
+    # Create/update all environments that exist remotely
+    output "syncing current remote branches" if @options.verbose
+    for branch in rbranches
+      # we assume branchname == environment here
+      # Mapping into a diff. environment name is done in the update function
+      if not valid_branchname(branch) 
+        output %Q{Branch "#{branch}" contains non-word characters, ignoring it.} unless @options.quiet
+        next
+      elsif branch == "production"
+        output %Q{Branch name "#{branch}" is reserved, ignoring it} unless @options.quiet
+        next
+      end
+      output "Syncing branch: #{branch}" unless @options.quiet
+      exit_code |= update(branch, branch)
+    end
+    return exit_code
+
+  rescue => exception
+    output exception.message unless @options.quiet or @options.verbose
+    output exception.backtrace if @options.verbose
+    return 1
+    
   end
 
   def update(branch, environment, opts={})
@@ -92,16 +221,25 @@ class PuppetSync
       raise "ERROR: Environment directory is not managed by puppet-sync."
     end
 
+    deploy = deploy_directory(environment)
     if opts[:delete]
+      if branch == "master" or branch == "production"
+        raise %Q{ERROR: You attempted to delete the "#{branch}" branch:\n (#{deploy}}
+      end
       FileUtils.remove_dir(deploy) if File.exists?(deploy)
       output "Deleting: #{deploy}" if @options.verbose
     else
       unless File.directory?(deploy)
-        clone_output = git(:clone, @options.repository, deploy, '-b', branch)
+        clone_output = git(:clone, '--shared', @options.repository, deploy, '-b', branch)
         if clone_output.match(/using HEAD instead$/)
           FileUtils.remove_dir(deploy) if File.exists?(deploy)
           output "Deleting: #{deploy}" if @options.verbose
           raise "ERROR: unable to clone from branch #{branch}"
+        else
+          # @@ add the access rights as an @options
+          # git 1.7 doesn't allow to set the rights of the top level directory of a repo
+          # so we have to set them by hand
+          File.chmod(0770, "#{deploy}")
         end
       end
 
@@ -126,22 +264,26 @@ class PuppetSync
           end
         end
 
+        # Nudge Puppet to re-scan the node definition files.
         output "Touch: #{STAMP}" if @options.verbose
         FileUtils.touch(STAMP)
       end
     end
+    return 0
+
   rescue => exception
-    output exception.message unless @options.quiet or @options.verbose
+    output exception.message unless @options.quiet
     output exception.backtrace if @options.verbose
     return 1
-  return 0
+
   end
+
 
   def git(subcommand, *args)
     @gitverbose ||= @options.verbose ? '' : '--quiet'
     command = ["git #{subcommand.to_s} #{@gitverbose}", args].flatten.compact.join(' ')
     case subcommand.to_sym
-    when :config, :"ls-files"
+    when :config, :"ls-files", :"ls-remote"
       execute(command.sub(@gitverbose, ''))
     else
       execute(command)
@@ -167,7 +309,12 @@ class PuppetSync
   end
 
   def deploy_directory(branch)
-    return "#{@options.deploy}/#{branch}"
+    if BRANCH_MAP[branch] != nil
+      environment_name = BRANCH_MAP[branch]
+    else
+      environment_name = branch
+    end 
+    return "#{@options.deploy}/#{environment_name}"
   end
 
   def parsed_options?
@@ -199,9 +346,14 @@ class PuppetSync
       @options.submodules = paths.split(',').join(' ')
     end
 
+    opts.on('-fs', '--full-sync', 'Do a full sync: download missing environments and delete non-existing ones') do
+      @options.full_sync = true
+    end
+    
     opts.on('-q', '--quiet', 'Only print Errors') do
       @options.quiet = true
     end
+
     opts.separator "Common options:"
     opts.on('-V', '--version', 'Display the script version.') { output_version ; exit 0; }
     opts.on('-v', '--verbose', 'Be more verbose.') { @options.verbose = true }
@@ -216,7 +368,17 @@ class PuppetSync
 
   def arguments_valid?
     case
+    when @options.full_sync
+      valid = true
     when @options.branch.nil?
+      valid = false
+    else
+      valid = true
+    end
+  end
+
+  def valid_branchname(branch)
+    if branch =~ /[\W]/
       valid = false
     else
       valid = true
