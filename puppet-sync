@@ -64,7 +64,7 @@ class PuppetSync
 
   VERSION = "1.2-pdxcat2+w3c1"
   STAMP   = ".puppet-sync-stamp"
-  SITE_MANIFEST = "manifests/site.pp"
+  MAIN_MANIFEST = "manifests/"
 
   # Mapping of branches to directories.  In many cases, the master branch is 
   # checked out to the 'development' environment.
@@ -268,9 +268,9 @@ class PuppetSync
         # Nudge Puppet to re-scan the node definition files.
         output "Touch: #{STAMP}" if @options.verbose
         FileUtils.touch(STAMP)
-        # We also need to nudge the site.pp file or puppet won't react
+        # We also need to nudge the manifests directory or puppet won't react
         # to new nodes being created
-        FileUtils.touch(SITE_MANIFEST)
+        FileUtils.touch(MAIN_MANIFEST)
       end
     end
     return 0
